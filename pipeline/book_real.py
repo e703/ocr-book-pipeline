@@ -138,14 +138,12 @@ def main():
             ordered = reading_order(texts, boxes)
             t_ocr = time.perf_counter() - t0
 
-            # build page: 150dpi denoised bg + invisible text layer
+            # build page: native-res bg (no downscale/blur — keeps it readable) + invisible text layer
             h, w = gray.shape
             pw, ph = doc[pno - 1].rect.width, doc[pno - 1].rect.height
-            bg = cv2.resize(gray, (int(w * 0.75), int(h * 0.75)), interpolation=cv2.INTER_AREA)
-            bg = cv2.medianBlur(bg, 5)
             page = outdoc.new_page(width=pw, height=ph)
             page.insert_image(pymupdf.Rect(0, 0, pw, ph),
-                              stream=cv2.imencode(".jpg", bg, [cv2.IMWRITE_JPEG_QUALITY, 80])[1].tobytes())
+                              stream=cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes())
             lines = 0
             for txt, box in ordered:
                 pts = box
