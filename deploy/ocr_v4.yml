@@ -1,0 +1,38 @@
+# PaddleOCR serving config pinned for this host (i7-6650U, 4-thread CPU, no GPU)
+# - PP-OCRv4 mobile (fastest reliable combo on paddle 3.0.0 + MKLDNN)
+# - doc preprocessing (orientation/unwarping) disabled: costs ~1s+/page on this CPU
+# - textline orientation kept (cheap, helps rotated lines)
+pipeline_name: OCR
+
+text_type: general
+
+use_doc_preprocessor: False
+use_textline_orientation: True
+
+Serving:
+  visualize: false
+  extra:
+    # 解除单请求最多 10 页的硬限制（null = 不限）
+    max_num_input_imgs: null
+
+SubModules:
+  TextDetection:
+    module_name: text_detection
+    model_name: PP-OCRv4_mobile_det
+    model_dir: null
+    limit_side_len: 960
+    limit_type: max
+    thresh: 0.3
+    box_thresh: 0.6
+    unclip_ratio: 1.5
+  TextLineOrientation:
+    module_name: textline_orientation
+    model_name: PP-LCNet_x1_0_textline_ori
+    model_dir: null
+    batch_size: 6
+  TextRecognition:
+    module_name: text_recognition
+    model_name: PP-OCRv4_mobile_rec
+    model_dir: null
+    batch_size: 6
+    score_thresh: 0.0

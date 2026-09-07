@@ -1,0 +1,17 @@
+services:
+  ocr:
+    build: .
+    image: ocrserv:local
+    container_name: paddleocr
+    ports:
+      - "8080:8080"
+    volumes:
+      # persist model downloads (~350MB) so restarts are instant
+      - ./paddlex_cache:/root/.paddlex
+      # optional: shared input/output dir if you prefer files over base64
+      - ./data:/data
+    restart: unless-stopped
+    # 4-thread CPU: keep at 1 replica. 2 processes already contend for threads.
+    # memory limit: ~1.2GB per process + engine overhead
+    mem_limit: 2g
+    shm_size: 2g
