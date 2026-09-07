@@ -1,4 +1,14 @@
-results/
+# 受版权保护的书籍内容，不推送到 GitHub
+results/*.pdf
+results/*.PDF
+results/text/
+results/previews/
+results/.ocr_cache/
+# Python
 __pycache__/
 *.pyc
+.venv/
+venv/
+# 其他
 .DS_Store
+*.log
