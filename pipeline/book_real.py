@@ -20,6 +20,8 @@ MAX_PAGES = int(os.environ.get("MAX_PAGES", "20"))
 START = int(os.environ.get("START_PAGE", "1"))
 OCR_DPI = 200.0
 SCALE = 72.0 / OCR_DPI
+CLEAN = os.environ.get("CLEAN", "1") != "0"   # clean show-through on the visible background only
+KEEP_COVER = os.environ.get("KEEP_COVER", "1") != "0"  # page 1 (cover): original color, untouched
 
 os.makedirs(f"{OUT}/text", exist_ok=True)
 os.makedirs(f"{OUT}/previews", exist_ok=True)
@@ -35,12 +37,37 @@ def deskew(gray):
         score = float(np.var(rot.sum(axis=1, dtype=np.float32)))
         if score > best_s:
             best_s, best_a = score, a
-    if abs(best_a) < 0.2:
-        return gray, best_a
+    return _apply_angle(gray, best_a), best_a
+
+
+def _apply_angle(gray, ang, interp=cv2.INTER_CUBIC):
+    """Rotate gray by ang degrees around center; no-op for tiny angles (matches deskew)."""
+    if abs(ang) < 0.2:
+        return gray
     h, w = gray.shape
-    M = cv2.getRotationMatrix2D((w / 2, h / 2), best_a, 1.0)
-    out = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderValue=255)
-    return out, best_a
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
+    return cv2.warpAffine(gray, M, (w, h), flags=interp, borderValue=255)
+
+
+def clean_out(gray):
+    """Visible-background show-through removal (OUTPUT image only — never feed OCR).
+
+    Returns (flat, d, tau): flat = show-through-suppressed background (steep darkness
+    ramp), d = darkness map (bg_estimate - gray), tau = per-page threshold.
+    NOTE: the ramp alone eats anti-aliased stroke edges; the caller composites the
+    NATIVE strokes back inside OCR text boxes, so this flat layer is only visible
+    in margins/gaps. Measured: margin dark-pixel 16-46% -> <3.5%."""
+    bg = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, np.ones((51, 51), np.uint8))
+    d = (bg.astype(np.int16) - gray.astype(np.int16)).clip(0, 255)
+    otsu_d = int(cv2.threshold(d.astype(np.uint8), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[0])
+    tau = max(55, int(otsu_d * 1.15))
+    flat = (255 - np.clip((d - tau) * 4.0, 0, 255)).astype(np.uint8)
+    return flat, d, tau
+
+
+def unsharp(gray, amount=1.5, sigma=2.0):
+    """Mild unsharp mask: crisp text edges without halos (measured +50-70% lapVar)."""
+    return cv2.addWeighted(gray, amount, cv2.GaussianBlur(gray, (0, 0), sigma), 1 - amount, 0)
 
 
 def page_image(doc, pno):
@@ -123,27 +150,58 @@ def main():
         for pno in range(START, min(npages, needed) + 1):
             t0 = time.perf_counter()
             img, iw, ih = page_image(doc, pno)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3, 3), 0)
-            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
-            gray, ang = deskew(gray)
+            raw = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            cover = KEEP_COVER and pno == 1   # cover: keep original color page, untouched
+            # --- OCR path: unchanged raw-enhance chain. Cleaning HURTS small/faint text
+            # (footnotes, page numbers) on heavy show-through pages — OCR stays on raw.
+            ocr_gray = cv2.GaussianBlur(raw, (3, 3), 0)
+            ocr_gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(ocr_gray)
+            if cover:
+                ang = 0.0                     # cover stays exactly as scanned (no deskew)
+            else:
+                ocr_gray, ang = deskew(ocr_gray)
             # downscale to OCR working size (max side 2400px) for speed
-            if max(gray.shape) > 2400:
-                f = 2400 / max(gray.shape)
-                gray = cv2.resize(gray, (int(gray.shape[1] * f), int(gray.shape[0] * f)),
-                                  interpolation=cv2.INTER_AREA)
-            rgb = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+            if max(ocr_gray.shape) > 2400:
+                f = 2400 / max(ocr_gray.shape)
+                ocr_gray = cv2.resize(ocr_gray, (int(ocr_gray.shape[1] * f), int(ocr_gray.shape[0] * f)),
+                                      interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(ocr_gray, cv2.COLOR_GRAY2RGB)
             res = ocr.predict(rgb)[0]
             texts, boxes = res["rec_texts"], res["rec_boxes"]
             ordered = reading_order(texts, boxes)
             t_ocr = time.perf_counter() - t0
+            # --- output background: cleaned flat bg + NATIVE strokes composited inside OCR
+            # boxes (shape-exact text — the darkness ramp alone eats stroke edges).
+            # Everything in deskewed native space so OCR box coordinates align 1:1.
+            out_gray = ocr_gray   # default: OCR enhance chain (CLEAN=0 / fallthrough)
+            if cover:
+                out_bgr = img   # visible page = original color image, zero processing
+            elif CLEAN:
+                nat = _apply_angle(raw, ang, interp=cv2.INTER_LANCZOS4)
+                flat, dmap, tau = clean_out(nat)
+                mask = np.zeros(nat.shape, np.uint8)
+                s = nat.shape[1] / ocr_gray.shape[1]   # OCR coords -> native res
+                for _, box in ordered:
+                    pts = (np.asarray(box, dtype=np.float32).reshape(-1, 2) * s).astype(np.int32)
+                    cv2.fillPoly(mask, [pts], 1)
+                mask = cv2.dilate(mask, np.ones((3, 3), np.uint8), iterations=3)
+                mask = (mask & (dmap > 20).astype(np.uint8)).astype(np.float32)
+                mask = cv2.GaussianBlur(mask, (3, 3), 0)   # feather the seam
+                out_gray = (flat.astype(np.float32) * (1 - mask) + nat.astype(np.float32) * mask).astype(np.uint8)
+                out_gray = unsharp(out_gray, amount=1.3)
+            else:
+                out_gray = ocr_gray
 
             # build page: native-res bg (no downscale/blur — keeps it readable) + invisible text layer
-            h, w = gray.shape
+            h, w = ocr_gray.shape
             pw, ph = doc[pno - 1].rect.width, doc[pno - 1].rect.height
             page = outdoc.new_page(width=pw, height=ph)
-            page.insert_image(pymupdf.Rect(0, 0, pw, ph),
-                              stream=cv2.imencode(".jpg", gray, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes())
+            if cover:
+                stream = cv2.imencode(".jpg", cv2.cvtColor(img, cv2.COLOR_BGR2RGB),
+                                      [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
+            else:
+                stream = cv2.imencode(".jpg", out_gray, [cv2.IMWRITE_JPEG_QUALITY, 88])[1].tobytes()
+            page.insert_image(pymupdf.Rect(0, 0, pw, ph), stream=stream)
             lines = 0
             for txt, box in ordered:
                 pts = box
